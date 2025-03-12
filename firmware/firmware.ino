@@ -40,6 +40,14 @@
 #define WATER_THRESHOLD 1      // Water Sensor Value Threshold
 #define WATER_READING_TIME 100 // Time (ms, >= 2) for each level to be powered and measured
 
+// ROTATION
+#define ROTATION_MOTOR_PIN 2      // Rotation Motor Control Pin
+#define ROTATION_MOTOR_VALUE 250  // Value to be given on the Control Pin (<= 255)
+#define ROTATION_PERIOD 3         // Timer WakeUps Count for Pot to rotate after
+#define ROTATION_MS_LIMIT 10000   // Maximum rotation time (ms)
+#define ROTATION_LIGHT_DIFF_MIN 5 // Average difference in light metrics range for Pot to stop rotating
+#define ROTATION_LIGHT_DIFF_MAX 275
+
 // GLOBALS
 RTC_DATA_ATTR int timerWakeUpCount = 0;
 int buttonWakeUp = 0;
@@ -153,12 +161,55 @@ int readWater()
   return 0;
 }
 
+// AUTOMATION
+int rotatedLightDiff(Light before, Light after)
+{
+  int diff1 = abs(before.l1Raw - after.l2Raw);
+  int diff2 = abs(before.l2Raw - after.l3Raw);
+  int diff3 = abs(before.l3Raw - after.l1Raw);
+
+  return (diff1 + diff2 + diff3) / 3;
+}
+
+void rotate()
+{
+  if (buttonWakeUp != 0 || timerWakeUpCount % ROTATION_PERIOD != 0 || timerWakeUpCount == 0)
+  {
+    return;
+  }
+
+  int start = millis();
+  Light before = readLight();
+
+  analogWrite(ROTATION_MOTOR_PIN, ROTATION_MOTOR_VALUE);
+  delay(1000);
+  while (true)
+  {
+    int now = millis();
+    if (now - start >= ROTATION_MS_LIMIT)
+    {
+      break;
+    }
+
+    Light after = readLight();
+
+    int diff = rotatedLightDiff(before, after);
+    if (ROTATION_LIGHT_DIFF_MIN < diff && diff <= ROTATION_LIGHT_DIFF_MAX)
+    {
+      break;
+    }
+  }
+  analogWrite(ROTATION_MOTOR_PIN, 0);
+}
+
 // LIFECYCLE
 void normalMode()
 {
   // I2C Init
   Wire.begin();
   sht.begin();
+
+  rotate();
 
   Serial.println("Measurements:");
 
