@@ -1,5 +1,9 @@
 #include <Wire.h>
 #include <SHT2x.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <PubSubClient.h>
+#include <ArduinoJson.h>
 
 // UTILITY DEFINES
 #define MILLIS_TO_MICROS_FACTOR 1000
@@ -58,10 +62,31 @@
 #define WATERING_MOISTURE_MIN 10     // Range to keep moisture in
 #define WATERING_MOISTURE_MAX 50
 
+// WIFI
+#define WIFI_SSID "SpacemanNetwork"
+#define WIFI_PASSWORD "12345678"
+#define WIFI_TIMEOUT 10000
+#define WIFI_BACKEND "192.168.1.231:3000"
+#define WIFI_BACKEND_STATUS_ENDPOINT "/status"
+
+// MQTT
+#define MQTT_BROKER "192.168.1.231"
+#define MQTT_PORT 1883
+#define MQTT_USERNAME "client1"
+#define MQTT_PASSWORD "Pass1234"
+#define MQTT_TOPIC "lc/plants/plant001"
+#define MQTT_POT_ID 1
+#define MQTT_TIMEOUT 10000
+#define MQTT_ERROR_REPORT_ENDPOINT "/pot/report/mqtt"
+
 // GLOBALS
 RTC_DATA_ATTR int timerWakeUpCount = 0;
 int buttonWakeUp = 0;
+
 SHT2x sht;
+
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
 
 // TYPES
 struct HumAndTemp
@@ -101,6 +126,23 @@ int isButtonHeld(int pin, int time)
       return 1;
     }
   }
+}
+
+int isServerAvailable()
+{
+  if (WiFi.status() != WL_CONNECTED)
+  {
+    return 0;
+  }
+
+  String host = WIFI_BACKEND;
+  String path = WIFI_BACKEND_STATUS_ENDPOINT;
+
+  HTTPClient http;
+  http.begin("http://" + host + path);
+  int code = http.GET();
+  http.end();
+  return code == 200;
 }
 
 // MEASURING
@@ -251,6 +293,25 @@ void normalMode()
   Light light = readLight();
   HumAndTemp humAndTemp = readHumAndTemp();
 
+  // Sending Measurements
+  if (mqttClient.connected())
+  {
+    JsonDocument payload;
+    payload["potId"] = MQTT_POT_ID;
+    payload["temperature"] = humAndTemp.temperature;
+    payload["humidity"] = humAndTemp.humidity;
+    payload["moisture"] = moisture;
+    payload["light"] = light.max;
+    payload["water"] = water;
+
+    char output[256];
+    serializeJson(payload, output);
+
+    mqttClient.publish(MQTT_TOPIC, output);
+
+    mqttClient.loop();
+  }
+
   // Printing Measurements
   Serial.println("Measurements:");
   Serial.print("Moisture: ");
@@ -282,6 +343,7 @@ void pairingMode()
 {
   Serial.println("Pairing Mode");
   delay(1000);
+  ESP.restart();
 }
 
 void setup()
@@ -304,15 +366,51 @@ void setup()
     analogWrite(USER_LED_PIN, 0);
   }
 
-  // Pairing Mode Check
+  // Manual Pairing Mode Check
   if (isButtonHeld(USER_BUTTON_PIN, PAIRING_MODE_HOLD_TIME) == 1)
   {
     pairingMode();
   }
+
+  // WiFi Init
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  int wifiInitStart = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - wifiInitStart < WIFI_TIMEOUT)
+  {
+    delay(250);
+  }
+  if (isServerAvailable())
+  {
+
+    // MQTT Init
+    mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
+    int mqttInitStart = millis();
+    while (!mqttClient.connected() && millis() - mqttInitStart < MQTT_TIMEOUT)
+    {
+      String client_id = "esp32-client-";
+      client_id += String(WiFi.macAddress());
+      if (!mqttClient.connect(client_id.c_str(), MQTT_USERNAME, MQTT_PASSWORD))
+      {
+        delay(1000);
+      }
+    }
+    if (!mqttClient.connected())
+    {
+      String host = WIFI_BACKEND;
+      String path = MQTT_ERROR_REPORT_ENDPOINT;
+
+      HTTPClient http;
+      http.begin("http://" + host + path + "?code=" + mqttClient.state());
+      http.GET();
+      http.end();
+    }
+  }
   else
   {
-    normalMode();
+    Serial.println("SERVER CONNECTION FAILED");
   }
+
+  normalMode();
 
   Serial.flush();
 
