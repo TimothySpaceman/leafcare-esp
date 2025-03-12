@@ -19,15 +19,15 @@
 #define LIGHT_PIN1 32 // Light Sensor 1 Pins
 #define LIGHT_PIN2 35
 #define LIGHT_PIN3 34
-#define LIGHT_MIN 0 // Light Sensor Value Range
-#define LIGHT_MAX 4096
+#define LIGHT_SENSOR_MIN 0 // Light Sensor Value Range
+#define LIGHT_SENSOR_MAX 4096
 
 // MOISTURE
-#define MOISTURE_SENSOR_PIN 33 // Moisture Sensor Pin
-#define MOISTURE_MIN 3015      // Moisture Sensor Value Range
-#define MOISTURE_MAX 1650
+#define MOISTURE_SENSOR_PIN 33   // Moisture Sensor Pin
+#define MOISTURE_SENSOR_MIN 3015 // Moisture Sensor Value Range
+#define MOISTURE_SENSOR_MAX 1650
 
-// WATER
+// WATER TANK
 #define WATER_L1_PIN 13 // Water Level Pins
 #define WATER_L2_PIN 12
 #define WATER_L3_PIN 14
@@ -36,17 +36,27 @@
 #define WATER_L2_VALUE 50
 #define WATER_L3_VALUE 75
 #define WATER_L4_VALUE 100
-#define WATER_SENSOR_PIN 39    // Water Sensor Pin
-#define WATER_THRESHOLD 1      // Water Sensor Value Threshold
-#define WATER_READING_TIME 100 // Time (ms, >= 2) for each level to be powered and measured
+#define WATER_SENSOR_PIN 39   // Water Sensor Pin
+#define WATER_THRESHOLD 1     // Water Sensor Value Threshold
+#define WATER_READING_TIME 20 // Time (ms, >= 2) for each level to be powered and measured
 
 // ROTATION
-#define ROTATION_MOTOR_PIN 2      // Rotation Motor Control Pin
-#define ROTATION_MOTOR_VALUE 250  // Value to be given on the Control Pin (<= 255)
-#define ROTATION_PERIOD 3         // Timer WakeUps Count for Pot to rotate after
-#define ROTATION_MS_LIMIT 10000   // Maximum rotation time (ms)
-#define ROTATION_LIGHT_DIFF_MIN 5 // Average difference in light metrics range for Pot to stop rotating
-#define ROTATION_LIGHT_DIFF_MAX 275
+#define ROTATION_MOTOR_PIN 2       // Rotation Motor Control Pin
+#define ROTATION_MOTOR_VALUE 250   // Value to be given on the Motor Control Pin (<= 255)
+#define ROTATION_PERIOD 3          // Timer WakeUps Count for Pot to rotate after
+#define ROTATION_MS_LIMIT 10000    // Maximum rotation time (ms)
+#define ROTATION_LIGHT_DIFF_MIN 10 // Average difference in light metrics range for Pot to stop rotating
+#define ROTATION_LIGHT_DIFF_MAX 300
+
+// WATERING
+#define WATERING_PUMP_PIN 4          // Watering Pump Control Pin
+#define WATERING_PUMP_VALUE 250      // Value to be given on the Pump Control Pin (<= 255)
+#define WATERING_PERIOD 3            // Timer WakeUps Count for Pot to Water the plant
+#define WATERING_ITERATION_TIME 2000 // Watering iteration time (ms)
+#define WATERING_PAUSE_TIME 1000     // Watering pause time (ms)
+#define WATERING_ITERATIONS_LIMIT 5  // Maximum watering iterations
+#define WATERING_MOISTURE_MIN 10     // Range to keep moisture in
+#define WATERING_MOISTURE_MAX 50
 
 // GLOBALS
 RTC_DATA_ATTR int timerWakeUpCount = 0;
@@ -109,9 +119,9 @@ Light readLight()
   values.l1Raw = analogRead(LIGHT_PIN1);
   values.l2Raw = analogRead(LIGHT_PIN2);
   values.l3Raw = analogRead(LIGHT_PIN3);
-  values.l1 = constrain(map(values.l1Raw, LIGHT_MIN, LIGHT_MAX, 0, 100), 0, 100);
-  values.l2 = constrain(map(values.l2Raw, LIGHT_MIN, LIGHT_MAX, 0, 100), 0, 100);
-  values.l3 = constrain(map(values.l3Raw, LIGHT_MIN, LIGHT_MAX, 0, 100), 0, 100);
+  values.l1 = constrain(map(values.l1Raw, LIGHT_SENSOR_MIN, LIGHT_SENSOR_MAX, 0, 100), 0, 100);
+  values.l2 = constrain(map(values.l2Raw, LIGHT_SENSOR_MIN, LIGHT_SENSOR_MAX, 0, 100), 0, 100);
+  values.l3 = constrain(map(values.l3Raw, LIGHT_SENSOR_MIN, LIGHT_SENSOR_MAX, 0, 100), 0, 100);
   values.max = max(values.l1, max(values.l2, values.l3));
   return values;
 }
@@ -119,7 +129,7 @@ Light readLight()
 int readMoisture()
 {
   int value = analogRead(MOISTURE_SENSOR_PIN);
-  return constrain(map(value, MOISTURE_MIN, MOISTURE_MAX, 0, 100), 0, 100);
+  return constrain(map(value, MOISTURE_SENSOR_MIN, MOISTURE_SENSOR_MAX, 0, 100), 0, 100);
 }
 
 int readWaterPin(int pin)
@@ -171,7 +181,7 @@ int rotatedLightDiff(Light before, Light after)
   return (diff1 + diff2 + diff3) / 3;
 }
 
-void rotate()
+void rotating()
 {
   if (buttonWakeUp != 0 || timerWakeUpCount % ROTATION_PERIOD != 0 || timerWakeUpCount == 0)
   {
@@ -202,6 +212,27 @@ void rotate()
   analogWrite(ROTATION_MOTOR_PIN, 0);
 }
 
+void watering()
+{
+  if (readMoisture() > WATERING_MOISTURE_MIN || buttonWakeUp != 0 || timerWakeUpCount % WATERING_PERIOD != 0 || timerWakeUpCount == 0)
+  {
+    return;
+  }
+
+  for (int i = 0; i < WATERING_ITERATIONS_LIMIT; i++)
+  {
+    if (readWater() == 0 || readMoisture() >= WATERING_MOISTURE_MAX)
+    {
+      return;
+    }
+
+    analogWrite(WATERING_PUMP_PIN, WATERING_PUMP_VALUE);
+    delay(WATERING_ITERATION_TIME);
+    analogWrite(WATERING_PUMP_PIN, 0);
+    delay(WATERING_PAUSE_TIME);
+  }
+}
+
 // LIFECYCLE
 void normalMode()
 {
@@ -209,19 +240,23 @@ void normalMode()
   Wire.begin();
   sht.begin();
 
-  rotate();
+  // Automation
+  rotating();
+  delay(250);
+  watering();
 
-  Serial.println("Measurements:");
-
+  // Collecting Measurements
   int moisture = readMoisture();
+  int water = readWater();
+  Light light = readLight();
+  HumAndTemp humAndTemp = readHumAndTemp();
+
+  // Printing Measurements
+  Serial.println("Measurements:");
   Serial.print("Moisture: ");
   Serial.println(moisture);
-
-  int water = readWater();
   Serial.print("Water: ");
   Serial.println(water);
-
-  Light light = readLight();
   Serial.print("Light: ");
   Serial.print(light.max);
   Serial.print(" (");
@@ -237,8 +272,6 @@ void normalMode()
   Serial.print(", ");
   Serial.print(light.l3Raw);
   Serial.println(")");
-
-  HumAndTemp humAndTemp = readHumAndTemp();
   Serial.print("Humidity: ");
   Serial.println(humAndTemp.humidity);
   Serial.print("Temperature: ");
