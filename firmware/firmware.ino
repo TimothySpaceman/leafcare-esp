@@ -4,6 +4,11 @@
 #include <HTTPClient.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
+#include "nvs.h"
+#include "nvs_flash.h"
 
 // UTILITY DEFINES
 #define MILLIS_TO_MICROS_FACTOR 1000
@@ -63,8 +68,10 @@
 #define WATERING_MOISTURE_MAX 50
 
 // WIFI
-#define WIFI_SSID "SpacemanNetwork"
-#define WIFI_PASSWORD "12345678"
+#define WIFI_SSID ""
+#define WIFI_SSID_NVS_KEY "wifi_ssid"
+#define WIFI_PASSWORD ""
+#define WIFI_PASSWORD_NVS_KEY "wifi_password"
 #define WIFI_TIMEOUT 10000
 #define WIFI_BACKEND "192.168.1.231:3000"
 #define WIFI_BACKEND_STATUS_ENDPOINT "/status"
@@ -75,9 +82,15 @@
 #define MQTT_USERNAME "client1"
 #define MQTT_PASSWORD "Pass1234"
 #define MQTT_TOPIC "lc/plants/plant001"
-#define MQTT_POT_ID 1
+#define MQTT_POT_ID "10" // Must be a string!
 #define MQTT_TIMEOUT 10000
 #define MQTT_ERROR_REPORT_ENDPOINT "/pot/report/mqtt"
+
+// BLE
+#define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define POT_ID_UUID "59d99a3d-c694-4826-8fbf-26859fa7c4f0"
+#define WIFI_SSID_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
+#define WIFI_PASSWORD_UUID "aaf4a436-9747-4622-b57c-ec585c132325"
 
 // GLOBALS
 RTC_DATA_ATTR int timerWakeUpCount = 0;
@@ -89,6 +102,12 @@ WiFiClient wifiClient;
 PubSubClient mqttClient(wifiClient);
 
 // TYPES
+struct WiFiSettings
+{
+  char ssid[32];
+  char password[64];
+};
+
 struct HumAndTemp
 {
   float humidity;
@@ -143,6 +162,54 @@ int isServerAvailable()
   int code = http.GET();
   http.end();
   return code == 200;
+}
+
+int readWiFiSettings(WiFiSettings *settings)
+{
+  nvs_handle_t handle;
+  esp_err_t err = nvs_open("storage", NVS_READONLY, &handle);
+  if (err != ESP_OK)
+  {
+    Serial.println("Failed to open NVS.");
+    return 0;
+  }
+
+  size_t ssidSize = sizeof(settings->ssid);
+  err = nvs_get_str(handle, WIFI_SSID_NVS_KEY, settings->ssid, &ssidSize);
+  if (err != ESP_OK)
+  {
+    Serial.println("Failed to read SSID from NVS.");
+    nvs_close(handle);
+    return 0;
+  }
+
+  size_t passwordSize = sizeof(settings->password);
+  err = nvs_get_str(handle, WIFI_PASSWORD_NVS_KEY, settings->password, &passwordSize);
+  nvs_close(handle);
+  if (err != ESP_OK)
+  {
+    Serial.println("Failed to read password from NVS.");
+    return 0;
+  }
+
+  return 1;
+}
+
+esp_err_t saveString(const char *key, const char *value)
+{
+  nvs_handle_t handle;
+  esp_err_t err = nvs_open("storage", NVS_READWRITE, &handle);
+  if (err != ESP_OK)
+    return err;
+
+  err = nvs_set_str(handle, key, value);
+  if (err == ESP_OK)
+  {
+    err = nvs_commit(handle);
+  }
+
+  nvs_close(handle);
+  return err;
 }
 
 // MEASURING
@@ -275,7 +342,7 @@ void watering()
   }
 }
 
-// LIFECYCLE
+// NORMAL MODE
 void normalMode()
 {
   // I2C Init
@@ -339,13 +406,71 @@ void normalMode()
   Serial.println(humAndTemp.temperature);
 }
 
+// PAIRING MODE
+class WiFiSsidCallBack : public BLECharacteristicCallbacks
+{
+public:
+  void onWrite(BLECharacteristic *pCharacteristic, esp_ble_gatts_cb_param_t *param)
+  {
+    saveString(WIFI_SSID_NVS_KEY, pCharacteristic->getValue().c_str());
+  }
+};
+
+class WiFiPasswordCallBack : public BLECharacteristicCallbacks
+{
+public:
+  void onWrite(BLECharacteristic *pCharacteristic, esp_ble_gatts_cb_param_t *param)
+  {
+    saveString(WIFI_PASSWORD_NVS_KEY, pCharacteristic->getValue().c_str());
+  }
+};
+
 void pairingMode()
 {
   Serial.println("Pairing Mode");
-  delay(1000);
+
+  WiFiSettings wifiSettings;
+  if (readWiFiSettings(&wifiSettings) == 0)
+  {
+    strcpy(wifiSettings.ssid, WIFI_SSID);
+    strcpy(wifiSettings.password, WIFI_PASSWORD);
+  }
+
+  BLEDevice::init((std::string("LEAFCARE-POT-") + MQTT_POT_ID).c_str());
+  BLEServer *pServer = BLEDevice::createServer();
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+
+  BLECharacteristic *pPotIdChar = pService->createCharacteristic(POT_ID_UUID, BLECharacteristic::PROPERTY_READ);
+  pPotIdChar->setValue(MQTT_POT_ID);
+
+  BLECharacteristic *pWiFiSsidChar = pService->createCharacteristic(WIFI_SSID_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
+  pWiFiSsidChar->setValue(wifiSettings.ssid);
+  pWiFiSsidChar->setCallbacks(new WiFiSsidCallBack());
+
+  BLECharacteristic *pWiFiPasswordChar = pService->createCharacteristic(WIFI_PASSWORD_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
+  pWiFiPasswordChar->setValue(wifiSettings.password);
+  pWiFiPasswordChar->setCallbacks(new WiFiPasswordCallBack());
+
+  pService->start();
+
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);
+  BLEDevice::startAdvertising();
+
+  Serial.println("Characteristic defined! Now you can read it in your phone!");
+
+  while (true)
+  {
+    delay(1000);
+    Serial.println("Pairing Loop");
+  }
+
   ESP.restart();
 }
 
+// LIFECYCLE
 void setup()
 {
   // Determining WakeUp Cause
@@ -373,7 +498,13 @@ void setup()
   }
 
   // WiFi Init
-  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  WiFiSettings wifiSettings;
+  if (readWiFiSettings(&wifiSettings) == 0)
+  {
+    pairingMode();
+  }
+
+  WiFi.begin(wifiSettings.ssid, wifiSettings.password);
   int wifiInitStart = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - wifiInitStart < WIFI_TIMEOUT)
   {
