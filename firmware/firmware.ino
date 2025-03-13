@@ -4,6 +4,9 @@
 #include <HTTPClient.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
+#include <BLEDevice.h>
+#include <BLEUtils.h>
+#include <BLEServer.h>
 
 // UTILITY DEFINES
 #define MILLIS_TO_MICROS_FACTOR 1000
@@ -78,6 +81,10 @@
 #define MQTT_POT_ID 1
 #define MQTT_TIMEOUT 10000
 #define MQTT_ERROR_REPORT_ENDPOINT "/pot/report/mqtt"
+
+// BLE
+#define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
+#define CHARACTERISTIC_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 
 // GLOBALS
 RTC_DATA_ATTR int timerWakeUpCount = 0;
@@ -275,7 +282,7 @@ void watering()
   }
 }
 
-// LIFECYCLE
+// NORMAL MODE
 void normalMode()
 {
   // I2C Init
@@ -339,13 +346,44 @@ void normalMode()
   Serial.println(humAndTemp.temperature);
 }
 
+// PAIRING MODE
+class CharacteristicCallBack : public BLECharacteristicCallbacks
+{
+public:
+  void onWrite(BLECharacteristic *pCharacteristic, esp_ble_gatts_cb_param_t *param)
+  {
+    Serial.println("New Value: " + pCharacteristic->getValue());
+  }
+};
+
 void pairingMode()
 {
   Serial.println("Pairing Mode");
-  delay(1000);
+
+  BLEDevice::init("LEAFCARE-POT-" + MQTT_POT_ID);
+  BLEServer *pServer = BLEDevice::createServer();
+  BLEService *pService = pServer->createService(SERVICE_UUID);
+  BLECharacteristic *pCharacteristic = pService->createCharacteristic(CHARACTERISTIC_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
+
+  pCharacteristic->setValue("Hello World!");
+  pCharacteristic->setCallbacks(new CharacteristicCallBack());
+  pService->start();
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SERVICE_UUID);
+  pAdvertising->setScanResponse(true);
+  pAdvertising->setMinPreferred(0x06);
+  BLEDevice::startAdvertising();
+  Serial.println("Characteristic defined! Now you can read it in your phone!");
+
+  while(true){
+    delay(1000);
+    Serial.println("Pairing Loop");
+  }
+
   ESP.restart();
 }
 
+// LIFECYCLE
 void setup()
 {
   // Determining WakeUp Cause
