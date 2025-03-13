@@ -89,8 +89,12 @@
 // BLE
 #define SERVICE_UUID "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
 #define POT_ID_UUID "59d99a3d-c694-4826-8fbf-26859fa7c4f0"
+#define RESTART_UUID "b7d8c6b8-aa64-49a5-8f37-d437acc2842b"
 #define WIFI_SSID_UUID "beb5483e-36e1-4688-b7f5-ea07361b26a8"
 #define WIFI_PASSWORD_UUID "aaf4a436-9747-4622-b57c-ec585c132325"
+
+// PAIRING
+#define PAIRING_MODE_TIMEOUT 45
 
 // GLOBALS
 RTC_DATA_ATTR int timerWakeUpCount = 0;
@@ -425,10 +429,21 @@ public:
   }
 };
 
+class RestartCallBack : public BLECharacteristicCallbacks
+{
+public:
+  void onWrite(BLECharacteristic *pCharacteristic, esp_ble_gatts_cb_param_t *param)
+  {
+    if (pCharacteristic->getValue() == "1")
+    {
+      ESP.restart();
+    }
+  }
+};
+
 void pairingMode()
 {
-  Serial.println("Pairing Mode");
-
+  // Reading the WiFi settings or replacing with defaults
   WiFiSettings wifiSettings;
   if (readWiFiSettings(&wifiSettings) == 0)
   {
@@ -436,18 +451,23 @@ void pairingMode()
     strcpy(wifiSettings.password, WIFI_PASSWORD);
   }
 
+  // BLE Init
   BLEDevice::init((std::string("LEAFCARE-POT-") + MQTT_POT_ID).c_str());
   BLEServer *pServer = BLEDevice::createServer();
   BLEService *pService = pServer->createService(SERVICE_UUID);
 
+  BLECharacteristic *restartChar = pService->createCharacteristic(RESTART_UUID, BLECharacteristic::PROPERTY_WRITE);
+  restartChar->setValue("0");
+  restartChar->setCallbacks(new RestartCallBack());
+
   BLECharacteristic *pPotIdChar = pService->createCharacteristic(POT_ID_UUID, BLECharacteristic::PROPERTY_READ);
   pPotIdChar->setValue(MQTT_POT_ID);
 
-  BLECharacteristic *pWiFiSsidChar = pService->createCharacteristic(WIFI_SSID_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
+  BLECharacteristic *pWiFiSsidChar = pService->createCharacteristic(WIFI_SSID_UUID, BLECharacteristic::PROPERTY_WRITE);
   pWiFiSsidChar->setValue(wifiSettings.ssid);
   pWiFiSsidChar->setCallbacks(new WiFiSsidCallBack());
 
-  BLECharacteristic *pWiFiPasswordChar = pService->createCharacteristic(WIFI_PASSWORD_UUID, BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE);
+  BLECharacteristic *pWiFiPasswordChar = pService->createCharacteristic(WIFI_PASSWORD_UUID, BLECharacteristic::PROPERTY_WRITE);
   pWiFiPasswordChar->setValue(wifiSettings.password);
   pWiFiPasswordChar->setCallbacks(new WiFiPasswordCallBack());
 
@@ -459,12 +479,14 @@ void pairingMode()
   pAdvertising->setMinPreferred(0x06);
   BLEDevice::startAdvertising();
 
-  Serial.println("Characteristic defined! Now you can read it in your phone!");
-
-  while (true)
+  // Loop to keep ESP here
+  int start = millis();
+  int lastState = 0;
+  while (millis() - start < PAIRING_MODE_TIMEOUT * 1000 || pServer->getConnectedCount() > 0)
   {
-    delay(1000);
-    Serial.println("Pairing Loop");
+    delay(500);
+    analogWrite(USER_LED_PIN, lastState);
+    lastState = 255 - lastState;
   }
 
   ESP.restart();
