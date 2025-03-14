@@ -50,6 +50,7 @@
 #define WATER_READING_TIME 20 // Time (ms, >= 2) for each level to be powered and measured
 
 // ROTATION
+#define ROTATION_ON true
 #define ROTATION_MOTOR_PIN 2       // Rotation Motor Control Pin
 #define ROTATION_MOTOR_VALUE 250   // Value to be given on the Motor Control Pin (<= 255)
 #define ROTATION_PERIOD 3          // Timer WakeUps Count for Pot to rotate after
@@ -75,6 +76,7 @@
 #define WIFI_TIMEOUT 10000
 #define WIFI_BACKEND "192.168.1.231:3000"
 #define WIFI_BACKEND_STATUS_ENDPOINT "/status"
+#define WIFI_BACKEND_UPDATE_ENDPOINT "/pot/esp-update/"
 
 // MQTT
 #define MQTT_BROKER "192.168.1.231"
@@ -95,15 +97,6 @@
 
 // PAIRING
 #define PAIRING_MODE_TIMEOUT 45
-
-// GLOBALS
-RTC_DATA_ATTR int timerWakeUpCount = 0;
-int buttonWakeUp = 0;
-
-SHT2x sht;
-
-WiFiClient wifiClient;
-PubSubClient mqttClient(wifiClient);
 
 // TYPES
 struct WiFiSettings
@@ -129,6 +122,25 @@ struct Light
   int l3Raw;
 };
 
+struct Settings
+{
+  int32_t moistureMin;
+  int32_t moistureMax;
+  int32_t esLevel;
+  bool rotation;
+};
+
+// GLOBALS
+RTC_DATA_ATTR int timerWakeUpCount = 0;
+int buttonWakeUp = 0;
+
+Settings potSettings;
+
+SHT2x sht;
+
+WiFiClient wifiClient;
+PubSubClient mqttClient(wifiClient);
+
 // UTILITIES
 int isButtonHeld(int pin, int time)
 {
@@ -151,6 +163,30 @@ int isButtonHeld(int pin, int time)
   }
 }
 
+// MEMORY
+esp_err_t saveString(const char *key, const char *value)
+{
+  nvs_handle_t handle;
+  esp_err_t err = nvs_open("storage", NVS_READWRITE, &handle);
+  if (err != ESP_OK)
+    return err;
+
+  err = nvs_set_str(handle, key, value);
+  if (err == ESP_OK)
+  {
+    err = nvs_commit(handle);
+  }
+
+  nvs_close(handle);
+  return err;
+}
+
+esp_err_t loadString(nvs_handle_t handle, const char *key, char *value, size_t *size)
+{
+  return nvs_get_str(handle, key, value, size);
+}
+
+// NETWORK
 int isServerAvailable()
 {
   if (WiFi.status() != WL_CONNECTED)
@@ -168,51 +204,164 @@ int isServerAvailable()
   return code == 200;
 }
 
-int readWiFiSettings(WiFiSettings *settings)
+int readWiFiSettings(WiFiSettings *wifiSettings)
 {
   nvs_handle_t handle;
   esp_err_t err = nvs_open("storage", NVS_READONLY, &handle);
   if (err != ESP_OK)
   {
-    Serial.println("Failed to open NVS.");
+    Serial.println("Failed to open NVS");
     return 0;
   }
 
-  size_t ssidSize = sizeof(settings->ssid);
-  err = nvs_get_str(handle, WIFI_SSID_NVS_KEY, settings->ssid, &ssidSize);
+  size_t ssidSize = sizeof(wifiSettings->ssid);
+  err = loadString(handle, WIFI_SSID_NVS_KEY, wifiSettings->ssid, &ssidSize);
   if (err != ESP_OK)
   {
-    Serial.println("Failed to read SSID from NVS.");
     nvs_close(handle);
     return 0;
   }
 
-  size_t passwordSize = sizeof(settings->password);
-  err = nvs_get_str(handle, WIFI_PASSWORD_NVS_KEY, settings->password, &passwordSize);
+  size_t passwordSize = sizeof(wifiSettings->password);
+  err = loadString(handle, WIFI_PASSWORD_NVS_KEY, wifiSettings->password, &passwordSize);
   nvs_close(handle);
   if (err != ESP_OK)
   {
-    Serial.println("Failed to read password from NVS.");
     return 0;
   }
 
   return 1;
 }
 
-esp_err_t saveString(const char *key, const char *value)
+int updatePotData()
+{
+  HTTPClient http;
+
+  String host = WIFI_BACKEND;
+  String path = String(WIFI_BACKEND_UPDATE_ENDPOINT) + String(MQTT_POT_ID);
+
+  http.begin("http://" + host + path);
+  int httpCode = http.GET();
+  if (httpCode == 200)
+  {
+    String payload = http.getString();
+    StaticJsonDocument<200> doc;
+    DeserializationError error = deserializeJson(doc, payload);
+
+    if (error)
+    {
+      Serial.print("Failed to parse JSON: ");
+      Serial.println(error.f_str());
+      http.end();
+      return 0;
+    }
+
+    potSettings.moistureMin = doc["moistureMin"];
+    potSettings.moistureMax = doc["moistureMax"];
+    potSettings.rotation = doc["rotation"];
+    potSettings.esLevel = doc["esLevel"];
+    savePotSettings();
+
+    Serial.println("Pot Data Update:");
+    Serial.print("Moisture Min: ");
+    Serial.println(potSettings.moistureMin);
+    Serial.print("Moisture Max: ");
+    Serial.println(potSettings.moistureMax);
+    Serial.print("Rotation: ");
+    Serial.println(potSettings.rotation ? "Enabled" : "Disabled");
+    Serial.print("ES Level: ");
+    Serial.println(potSettings.esLevel);
+  }
+  else
+  {
+    Serial.print("HTTP request failed with code: ");
+    Serial.println(httpCode);
+    return 0;
+  }
+
+  http.end();
+  return 1;
+}
+
+// SETTINGS
+esp_err_t loadPotSettings()
+{
+  nvs_handle_t handle;
+  esp_err_t err = nvs_open("storage", NVS_READONLY, &handle);
+  if (err != ESP_OK)
+  {
+    return err;
+  }
+
+  err = nvs_get_i32(handle, "moisture_min", &potSettings.moistureMin);
+  if (err != ESP_OK)
+  {
+    potSettings.moistureMin = WATERING_MOISTURE_MIN;
+  }
+
+  err = nvs_get_i32(handle, "moisture_max", &potSettings.moistureMax);
+  if (err != ESP_OK)
+  {
+    potSettings.moistureMax = WATERING_MOISTURE_MAX;
+  }
+
+  err = nvs_get_i32(handle, "es_level", &potSettings.esLevel);
+  if (err != ESP_OK)
+  {
+    potSettings.esLevel = 3;
+  }
+
+  uint8_t rotation;
+  err = nvs_get_u8(handle, "rotation", &rotation);
+  if (err == ESP_OK)
+  {
+    potSettings.rotation = rotation != 0;
+  }
+  else
+  {
+    potSettings.rotation = ROTATION_ON;
+  }
+
+  nvs_close(handle);
+  return ESP_OK;
+}
+
+esp_err_t savePotSettings()
 {
   nvs_handle_t handle;
   esp_err_t err = nvs_open("storage", NVS_READWRITE, &handle);
   if (err != ESP_OK)
-    return err;
-
-  err = nvs_set_str(handle, key, value);
-  if (err == ESP_OK)
   {
-    err = nvs_commit(handle);
+    return err;
   }
 
+  err = nvs_set_i32(handle, "moisture_min", potSettings.moistureMin);
+  if (err != ESP_OK)
+  {
+    return err;
+  }
+
+  err = nvs_set_i32(handle, "moisture_max", potSettings.moistureMax);
+  if (err != ESP_OK)
+  {
+    return err;
+  }
+
+  err = nvs_set_i32(handle, "es_level", potSettings.esLevel);
+  if (err != ESP_OK)
+  {
+    return err;
+  }
+
+  err = nvs_set_u8(handle, "rotation", potSettings.rotation ? 1 : 0);
+  if (err != ESP_OK)
+  {
+    return err;
+  }
+
+  err = nvs_commit(handle);
   nvs_close(handle);
+
   return err;
 }
 
@@ -296,7 +445,7 @@ int rotatedLightDiff(Light before, Light after)
 
 void rotating()
 {
-  if (buttonWakeUp != 0 || timerWakeUpCount % ROTATION_PERIOD != 0 || timerWakeUpCount == 0)
+  if (potSettings.rotation != 1 || buttonWakeUp != 0 || timerWakeUpCount % ROTATION_PERIOD != 0 || timerWakeUpCount == 0)
   {
     return;
   }
@@ -327,14 +476,14 @@ void rotating()
 
 void watering()
 {
-  if (readMoisture() > WATERING_MOISTURE_MIN || buttonWakeUp != 0 || timerWakeUpCount % WATERING_PERIOD != 0 || timerWakeUpCount == 0)
+  if (readMoisture() > potSettings.moistureMin || buttonWakeUp != 0 || timerWakeUpCount % WATERING_PERIOD != 0 || timerWakeUpCount == 0)
   {
     return;
   }
 
   for (int i = 0; i < WATERING_ITERATIONS_LIMIT; i++)
   {
-    if (readWater() == 0 || readMoisture() >= WATERING_MOISTURE_MAX)
+    if (readWater() == 0 || readMoisture() >= potSettings.moistureMax)
     {
       return;
     }
@@ -532,10 +681,13 @@ void setup()
   {
     delay(250);
   }
+
+  // Loading Pot Settings
+  loadPotSettings();
+
+  // MQTT Init
   if (isServerAvailable())
   {
-
-    // MQTT Init
     mqttClient.setServer(MQTT_BROKER, MQTT_PORT);
     int mqttInitStart = millis();
     while (!mqttClient.connected() && millis() - mqttInitStart < MQTT_TIMEOUT)
@@ -557,11 +709,23 @@ void setup()
       http.GET();
       http.end();
     }
+
+    updatePotData();
   }
   else
   {
     Serial.println("SERVER CONNECTION FAILED");
   }
+
+  Serial.println("SETTINGS:");
+  Serial.print("Moisture Min ");
+  Serial.println(potSettings.moistureMin);
+  Serial.print("Moisture Max ");
+  Serial.println(potSettings.moistureMax);
+  Serial.print("Rotation ");
+  Serial.println(potSettings.rotation);
+  Serial.print("ES Level ");
+  Serial.println(potSettings.esLevel);
 
   normalMode();
 
